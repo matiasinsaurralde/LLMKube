@@ -18,6 +18,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -238,7 +239,7 @@ func (a *MetalAgent) deleteProcess(ctx context.Context, key string) error {
 	}
 
 	if len(cleanupErrors) > 0 {
-		return fmt.Errorf("cleanup errors for %s: %v", key, cleanupErrors)
+		return fmt.Errorf("cleanup errors for %s: %w", key, errors.Join(cleanupErrors...))
 	}
 
 	a.logger.Infow("stopped inference service", "key", key)
@@ -252,15 +253,15 @@ func (a *MetalAgent) Shutdown(ctx context.Context) error {
 
 	a.logger.Infow("cleaning up running processes", "count", len(a.processes))
 
-	var errors []error
+	var shutdownErrors []error
 	for key, process := range a.processes {
 		if err := a.executor.StopProcess(process.PID); err != nil {
-			errors = append(errors, fmt.Errorf("failed to stop %s: %w", key, err))
+			shutdownErrors = append(shutdownErrors, fmt.Errorf("failed to stop %s: %w", key, err))
 		}
 	}
 
-	if len(errors) > 0 {
-		return fmt.Errorf("shutdown errors: %v", errors)
+	if len(shutdownErrors) > 0 {
+		return fmt.Errorf("shutdown errors: %w", errors.Join(shutdownErrors...))
 	}
 
 	return nil
