@@ -182,20 +182,210 @@ func extractFeatures(body []byte, r *http.Request, classHeader string) (RequestF
 		}
 	}
 
-	var partial struct {
-		Model  string `json:"model"`
-		Stream bool   `json:"stream"`
-	}
 	// Body may not be valid JSON yet at this point (the upstream may be
 	// more permissive). We extract what we can and proceed.
-	_ = json.Unmarshal(body, &partial)
+	model, isStream := parseModelStream(body)
 
 	return RequestFeatures{
-		Model:          partial.Model,
+		Model:          model,
 		Classification: strings.ToLower(headers[strings.ToLower(classHeader)]),
 		TaskComplexity: strings.ToLower(headers["x-llmkube-task-complexity"]),
 		Headers:        headers,
-	}, partial.Stream
+	}, isStream
+}
+
+// parseModelStream extracts the top-level "model" (string) and "stream"
+// (bool) fields from an OpenAI-style chat-completion body WITHOUT parsing the
+// (often multi-hundred-KB) messages/tools payload. A chat body's expensive
+// content is the messages array; model and stream are small top-level fields,
+// so a full json.Unmarshal spends ~all its time scanning bytes it discards.
+//
+// This walks the top-level object structurally and early-exits the moment both
+// fields are seen — so when model/stream precede the large arrays, those arrays
+// are never scanned at all. Values that are not model/stream are skipped with a
+// non-allocating boundary scan (no copy, unlike a json.RawMessage decode), so
+// the worst case (both fields after the array) is still a single O(n) pass with
+// no per-element allocation, never worse than the previous full Unmarshal.
+//
+// Value DECODING is delegated to encoding/json over the located byte span, so
+// string-escape and type semantics match json.Unmarshal exactly (including
+// case-insensitive key matching and type-mismatch → zero value). Only the
+// structural boundary scan is hand-rolled.
+//
+// Behaviour is identical to the previous json.Unmarshal(body, &{model,stream})
+// for every well-formed JSON object. A non-object / non-JSON body yields the
+// zero values. A truncated/malformed object is best-effort: it may surface
+// fields read cleanly before the corruption (the old code discarded them) — a
+// malformed body is not a supported input.
+func parseModelStream(body []byte) (model string, stream bool) {
+	i := skipWS(body, 0)
+	if i >= len(body) || body[i] != '{' {
+		return "", false // not a JSON object
+	}
+	i++
+
+	haveModel, haveStream := false, false
+	for {
+		i = skipWS(body, i)
+		if i >= len(body) {
+			return model, stream
+		}
+		switch body[i] {
+		case '}':
+			return model, stream
+		case ',':
+			i++
+			continue
+		case '"':
+			// fall through to key handling below
+		default:
+			return model, stream // malformed; best-effort with what we have
+		}
+
+		keyStart := i
+		keyEnd, ok := scanStringEnd(body, i)
+		if !ok {
+			return model, stream
+		}
+		i = skipWS(body, keyEnd)
+		if i >= len(body) || body[i] != ':' {
+			return model, stream
+		}
+		i = skipWS(body, i+1)
+		valStart := i
+		valEnd, ok := skipValue(body, i)
+		if !ok {
+			return model, stream
+		}
+		i = valEnd
+
+		// Key bytes include the surrounding quotes. json.Unmarshal matches
+		// struct field names case-insensitively, so we do too. Last write
+		// wins (no early-exit while only one field has been seen), matching
+		// encoding/json for duplicate keys.
+		key := body[keyStart:keyEnd]
+		switch {
+		case equalFoldKey(key, "model"):
+			var s string
+			if json.Unmarshal(body[valStart:valEnd], &s) == nil {
+				model = s
+			}
+			haveModel = true
+		case equalFoldKey(key, "stream"):
+			var b bool
+			if json.Unmarshal(body[valStart:valEnd], &b) == nil {
+				stream = b
+			}
+			haveStream = true
+		}
+		if haveModel && haveStream {
+			return model, stream // both captured — skip the rest of the body
+		}
+	}
+}
+
+func skipWS(b []byte, i int) int {
+	for i < len(b) {
+		switch b[i] {
+		case ' ', '\t', '\n', '\r':
+			i++
+		default:
+			return i
+		}
+	}
+	return i
+}
+
+// scanStringEnd returns the index just past the closing quote of the JSON
+// string beginning at b[i] (which must be '"'). ok is false if unterminated.
+func scanStringEnd(b []byte, i int) (int, bool) {
+	i++ // past opening quote
+	for i < len(b) {
+		switch b[i] {
+		case '\\':
+			i += 2 // skip the escape and its escaped char (\" \\ \uXXXX all safe)
+		case '"':
+			return i + 1, true
+		default:
+			i++
+		}
+	}
+	return i, false
+}
+
+// skipValue returns the index just past the complete JSON value starting at
+// b[i] (leading whitespace already consumed). ok is false on a malformed value.
+func skipValue(b []byte, i int) (int, bool) {
+	if i >= len(b) {
+		return i, false
+	}
+	switch b[i] {
+	case '"':
+		return scanStringEnd(b, i)
+	case '{', '[':
+		return skipContainer(b, i)
+	default:
+		// number / true / false / null: run to the next structural delimiter.
+		for i < len(b) {
+			switch b[i] {
+			case ',', '}', ']', ' ', '\t', '\n', '\r':
+				return i, true
+			default:
+				i++
+			}
+		}
+		return i, true // value runs to EOF (e.g. a bare top-level scalar)
+	}
+}
+
+// skipContainer skips a balanced object or array starting at b[i] ('{' or '['),
+// honoring strings so brackets inside string literals are not counted.
+func skipContainer(b []byte, i int) (int, bool) {
+	depth := 0
+	for i < len(b) {
+		switch b[i] {
+		case '"':
+			ni, ok := scanStringEnd(b, i)
+			if !ok {
+				return ni, false
+			}
+			i = ni
+		case '{', '[':
+			depth++
+			i++
+		case '}', ']':
+			depth--
+			i++
+			if depth == 0 {
+				return i, true
+			}
+		default:
+			i++
+		}
+	}
+	return i, false // unbalanced
+}
+
+// equalFoldKey reports whether the quoted JSON key (bytes including the
+// surrounding double quotes) equals target case-insensitively. target must be
+// lowercase ASCII; this avoids allocating a string per key. Keys containing
+// JSON escapes (e.g. "model") are not folded — they never occur for the
+// fixed field names we look for.
+func equalFoldKey(quoted []byte, target string) bool {
+	if len(quoted) != len(target)+2 || quoted[0] != '"' || quoted[len(quoted)-1] != '"' {
+		return false
+	}
+	inner := quoted[1 : len(quoted)-1]
+	for j := 0; j < len(target); j++ {
+		c := inner[j]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != target[j] {
+			return false
+		}
+	}
+	return true
 }
 
 // enforceFailClosed implements the runtime half of the fail-closed gate.
